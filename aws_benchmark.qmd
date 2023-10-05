@@ -1,0 +1,237 @@
+---
+title: "RIBBiTR AWS Benchmark"
+format: html
+editor: source
+---
+
+## Load Packages
+
+```{r}
+#| output: false
+
+start_time <- Sys.time()
+  
+if (!require(librarian)){
+  install.packages("librarian")
+  library(librarian)
+}
+
+librarian::shelf(tidyverse, RPostgres, DBI, here, lubridate, unmarked, mgcv, voxel, data.table)
+
+```
+
+## Connect to `survey_data` schema in `ribbitr` database
+
+```{r}
+#| output: false
+tryCatch({
+    drv <- dbDriver("Postgres")
+    print("Connecting to Database…")
+    connection <- dbConnect(drv,
+                 dbname = Sys.getenv("aws_dbname"),
+                 host = Sys.getenv("aws_host"),
+                 port = Sys.getenv("aws_port"),
+                 user = Sys.getenv("aws_user"),
+                 password = Sys.getenv("aws_password"),
+                 timezone=NULL)
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+    })
+
+#search path
+dbExecute(connection, "set search_path to survey_data")
+
+```
+
+## Query SERDP Bd data - abundance
+
+How do we want to handle day and night surveys?
+
+```{r}
+
+q_c <- "select r.region, s.site, v.date, v.survey_time,
+     s2.detection_type, c.species_capture
+     from region r
+     join site s on r.region_id = s.region_id 
+     join visit v on s.site_id = v.site_id 
+     join survey s2 on v.visit_id = s2.visit_id
+     join capture c on s2.survey_id = c.survey_id 
+     where r.region = 'pennsylvania'
+     and v.date < '2020-12-31';"
+
+raw_cap <- dbGetQuery(connection, q_c)
+
+
+q_v <- "select r.region, s.site, v.date
+        from region r
+        join site s on r.region_id = s.region_id 
+        join visit v on s.site_id = v.site_id 
+        where r.region = 'pennsylvania'
+        and v.date < '2020-12-31'"
+
+raw_visits <- dbGetQuery(connection, q_v) %>% 
+  select(!region)
+
+visits_per_site <- raw_visits %>% 
+  mutate(year = year(date)) %>% 
+  group_by(site) %>% 
+  summarise(n = n())
+```
+
+## Summarize Data
+
+```{r}
+
+mid_clean_cap <- raw_cap %>% 
+  drop_na(species_capture) %>% 
+  group_by(site, date, species_capture) %>% 
+  reframe(n = n())
+
+
+```
+
+## Populate Site Zeros
+```{r}
+
+clean_cap <- raw_visits %>% 
+  left_join(mid_clean_cap, by = c("site", "date")) %>% 
+  complete(nesting(date, site),
+           species_capture = unique(mid_clean_cap$species_capture),
+           fill = list(n = 0))
+
+```
+
+## Gam Model - per site per species - assumming detection of 1 - Nested for loop
+```{r}
+# Create empty objects
+species_list <- unique(clean_cap$species_capture)
+
+
+all_plots <- list()
+
+plots <- list()
+
+site_list <- unique(clean_cap$site)
+
+# Loop for site
+for (j in 1:length(site_list)){ 
+
+  
+
+# Loop through each species
+    for (i in 1:length(species_list)) {
+      
+      
+      # find species with low k value
+      k <- clean_cap %>% 
+        filter(species_capture == species_list[i],
+               site == site_list[j]) %>%
+        mutate(year_month = as_date(date, format = "%Y-%m"),
+               year_month = as.numeric(as.POSIXct(year_month, format = "%Y-%m")),
+               year_month = sort(year_month)) %>%  
+        select(year_month) %>% 
+        unique() %>% 
+        nrow()
+      
+      # only run models for species with k>8
+      if (k > 9) {
+
+          
+          # filter clean data set for species list of k>8
+          dat <- clean_cap %>% 
+            select(species_capture, date, n, site) %>% 
+            filter(species_capture == species_list[i],
+                   site == site_list[j]) %>%  
+            ungroup() %>% 
+            select(!species_capture, site) %>% 
+            mutate(unix = as_date(date, format = "%Y-%m"),
+                   unix = as.numeric(as.POSIXct(unix, format = "%Y-%m")),
+                   unix = sort(unix)) 
+    
+      
+          # run GAM per species
+          gam <- gam(n ~ s(unix, k = k), data = dat) 
+          
+          # create new object in environment for each model output per species
+          #assign(paste(site_list[j], "_",species_list[i], sep = ""), gam) 
+          
+          # Predictions
+          unix = seq(min(dat$unix), max(dat$unix), len=100)
+          newdata = data.frame(unix=unix)
+          gam_pred = predict(gam, newdata=newdata, type="response", se.fit = T)
+          newdata$pred = gam_pred$fit
+          newdata$upper_se <- gam_pred$fit + (2 * gam_pred$se.fit)
+          newdata$lower_se <- gam_pred$fit - (2 * gam_pred$se.fit)
+          
+          # save predictions
+          write_rds(as.data.frame(newdata), here("outputs", "abundance", "gam_unix_per_species_site", 
+                                                 paste(site_list[j], "_", species_list[i],".rds", sep = "")))
+          
+          
+          # Average prevalence for plotting
+          dat = data.table(dat)
+          dat[, c("month", "year"):=.(month(date), year(date))]
+          average_n = dat[, .(av_n=mean(n), mean_unix=mean(unix)), by=.(month, year)] 
+    
+          # make GAM plot 
+           p <- ggplot(newdata) + geom_line(aes(x=unix, y=pred)) +
+                                 geom_point(data=dat, aes(x=unix, y=n), size=3, alpha = 0.5) + # raw or predicted counts displayed?
+                                 geom_ribbon(aes(ymin = lower_se, ymax= upper_se, x = unix), alpha = 0.2, fill = "blue")+
+                                 xlab("Unix") + ylab("Abundance (Perfect Detection)") + theme_classic() +
+                                 coord_cartesian(ylim = c(0, max(newdata$upper_se) + 5)) + 
+                                 ggtitle(paste(site_list[j], "-", species_list[i], sep = ""))
+            
+            
+            
+            
+        # save GAM plot in list
+         plots[[i]] <- p
+         
+        
+      
+      }
+      
+      # Error checking during loop
+      print(paste("done with", site_list[j], "_", species_list[i]))
+    
+  }
+  
+  
+
+  all_plots[[j]] <- plots
+
+}
+
+
+```
+
+## Examine plots
+
+```{r}
+# Too pick certain sites
+site_list
+#then index the site of interest
+all_plots[2]
+
+```
+
+## Save plots
+
+```{r}
+
+p_list <- as.list(unlist(all_plots, recursive = FALSE))
+
+for (i in 1:length(p_list)) {
+  
+  ggsave(here("figures", "abundance", "gam_unix_per_species_site", paste(site_list[j], "_", species_list[i], ".jpeg", sep="")),
+         plot = p_list[[i]])
+  
+}
+
+end_time <- Sys.time()
+
+end_time - start_time
+
+```
