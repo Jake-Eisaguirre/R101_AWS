@@ -17,7 +17,7 @@ if (!require(librarian)){
   library(librarian)
 }
 
-librarian::shelf(tidyverse, RPostgres, DBI, here, lubridate, unmarked, mgcv, voxel, data.table)
+librarian::shelf(tidyverse, RPostgres, DBI, here, lubridate, mgcv, voxel, data.table)
 
 ```
 
